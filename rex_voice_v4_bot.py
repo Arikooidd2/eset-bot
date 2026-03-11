@@ -39,23 +39,35 @@ if not TG_TOKEN or not GROQ_KEY:
 client = OpenAI(api_key=GROQ_KEY, base_url="https://api.groq.com/openai/v1")
 
 
-def _llm_call_with_retry(fn, retries=3, base_delay=5.0):
+# Глобальный rate-limit guard
+# Если Groq вернул 429, следующие 15 секунд пропускаем LLM вызовы
+_GROQ_RATELIMIT_UNTIL: float = 0.0
+
+def _llm_call_with_retry(fn, retries=2, base_delay=2.0):
     """
     Обёртка с retry для LLM вызовов.
     429 (rate limit) → ждём и повторяем.
+    retries=2, delays=2s/4s — итого макс 6с ожидания вместо 35с.
     """
+    global _GROQ_RATELIMIT_UNTIL
+    # Если знаем что Groq сейчас перегружен — сразу молчим
+    if time.time() < _GROQ_RATELIMIT_UNTIL:
+        logger.warning(f"[LLM] Groq rate limit cooldown, пропускаем")
+        return None
     for attempt in range(retries):
         try:
             return fn()
         except Exception as e:
             msg = str(e).lower()
             if "429" in msg or "rate limit" in msg or "rate_limit" in msg:
-                wait = base_delay * (2 ** attempt)  # 5s, 10s, 20s
+                _GROQ_RATELIMIT_UNTIL = time.time() + 15.0  # 15 сек cooldown
+                wait = base_delay * (2 ** attempt)  # 2s, 4s
                 logger.warning(f"[LLM] Rate limit (попытка {attempt+1}/{retries}), жду {wait:.0f}с...")
                 time.sleep(wait)
             else:
                 raise  # остальные ошибки — пробрасываем сразу
     logger.error(f"[LLM] Все {retries} попытки исчерпаны — молчим")
+    _GROQ_RATELIMIT_UNTIL = time.time() + 15.0
     return None
 
 
@@ -2403,21 +2415,34 @@ async def process_message(update: Update, context, user, chat,
             get_setting("conflict_sens"), BOT_MODE.get("silent", False),
         ), llm_analysis=None,
     )
+    # Сохраняем сигнал для analyze_fast
+    _pre_brain.last_signal = getattr(_pre_decision, "_signal", None)
 
-    # Флуд и очевидное молчание — пропускаем дорогой LLM анализ
-    _use_fast = (not _pre_decision.should_respond and
-                 _pre_decision.reason in ("чистый_флуд","быстрый_поток_флуд",
-                                          "тихий_режим","бот_выключен",
-                                          "охлаждение","перебор_бот"))
-    if _use_fast:
+    # ── ЭКОНОМИЯ GROQ: LLM анализ только если бот будет отвечать ──
+    # При молчании делаем быстрый rule-based анализ без LLM вызова.
+    # Это убирает 429 rate limit при серии сообщений.
+    _silent_reasons = ("чистый_флуд", "быстрый_поток_флуд",
+                       "тихий_режим", "бот_выключен",
+                       "охлаждение", "перебор_бот",
+                       "молчание", "нет_триггера")
+    _skip_llm = (not _pre_decision.should_respond or
+                 _pre_decision.reason in _silent_reasons)
+
+    if _skip_llm:
+        # Rule-based анализ — 0ms, 0 токенов
+        _sig = _pre_brain.last_signal if hasattr(_pre_brain, "last_signal") else None
+        _aggr = _sig.aggression if _sig else 0.1
+        _topic = _sig.topic if _sig else "другое"
         analysis = {
-            "sentiment": 0.0, "aggression": 0.2, "emotionality": 0.3,
-            "topic": "флуд", "subtopic": "", "intent": "болтовня",
-            "directed_at_bot": False, "directed_at_user": None,
-            "is_conflict": False, "conflict_persons": [],
-            "topic_continuity": False, "rex_interest": 0.1, "flood_score": 0.9,
+            "sentiment": 0.0, "aggression": _aggr, "emotionality": 0.3,
+            "topic": _topic, "subtopic": "", "intent": "болтовня",
+            "directed_at_bot": (_sig.has_bot_name or _sig.has_mention) if _sig else False,
+            "directed_at_user": None, "is_conflict": _aggr > 0.5,
+            "conflict_persons": [], "topic_continuity": False,
+            "rex_interest": 0.1, "flood_score": 0.8,
         }
     else:
+        # LLM анализ — только когда реально нужен ответ
         analysis = deep_analyze(
             text=text, chat_id=chat.id, user_name=sender_name,
             chat_context=chat_context, known_names=known_names,

@@ -345,7 +345,7 @@ JSON (строго):
 
     def _call_llm(self, prompt: str) -> str:
         import time
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 resp = self.client.chat.completions.create(
                     model=self.model,
@@ -357,13 +357,13 @@ JSON (строго):
             except Exception as e:
                 msg = str(e).lower()
                 if "429" in msg or "rate_limit" in msg or "rate limit" in msg:
-                    wait = 5.0 * (2 ** attempt)
-                    logger.warning(f"[analyzer] Rate limit, жду {wait:.0f}с (попытка {attempt+1}/3)")
+                    wait = 2.0 * (2 ** attempt)  # 2s, 4s вместо 5/10/20
+                    logger.warning(f"[analyzer] Rate limit, жду {wait:.0f}с (попытка {attempt+1}/2)")
                     time.sleep(wait)
                 else:
                     logger.error(f"[analyzer] LLM error: {e}")
                     return "{}"
-        logger.error("[analyzer] Rate limit: все попытки исчерпаны")
+        logger.error("[analyzer] Rate limit: молчим")
         return "{}"
 
     # ── Парсинг ──────────────────────────────────────────────────
