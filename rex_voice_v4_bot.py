@@ -10,12 +10,13 @@ import edge_tts
 from openai import OpenAI
 
 try:
-    from vocab import (get_vocab_for_prompt, get_random_phrase, MAT, SLANG, SARCASM, PROVOCATIONS, SELFCMD_TEMPLATES,
+    from vocab import (get_vocab_for_prompt, get_random_phrase, MAT, SLANG, SARCASM, PROVOCATIONS,
                         FRIENDLY_WORDS, NEUTRAL_WORDS, WARY_WORDS, HOSTILE_WORDS, HATE_WORDS,
                         POSITIVE_SIGNALS, NEGATIVE_SIGNALS,
                         get_attitude_words, detect_attitude_signal,
                         COUNTER_SELFCMD, COUNTER_SELFCMD_SHORT,
-                        COUNTER_PARENT, COUNTER_PARENT_SHORT)
+                        COUNTER_PARENT, COUNTER_PARENT_SHORT,
+                        SELFCMD_TEMPLATES)
 except Exception:
     def get_vocab_for_prompt(): return "лол, кринж, база"
     def get_random_phrase(cat): return ""
@@ -31,31 +32,54 @@ except Exception:
 
 from brain import get_brain, build_settings
 from analyzer import init_analyzer, deep_analyze, record_bot_reply as analyzer_record_reply, build_response_instructions
+try:
+    from learner import (save_bot_reply_for_learning, record_reaction, detect_reaction,
+                         get_learned_phrase, get_user_best_mode, get_ai_provocation, learner_loop)
+    _LEARNER_OK = True
+except Exception as _le:
+    _LEARNER_OK = False
+    def save_bot_reply_for_learning(*a, **kw): pass
+    def record_reaction(*a, **kw): pass
+    def detect_reaction(text): return "reply"
+    def get_learned_phrase(*a, **kw): return None
+    def get_user_best_mode(*a, **kw): return "snark"
+    def get_ai_provocation(*a, **kw): return None
+    async def learner_loop(*a, **kw): pass
 load_dotenv()
 TG_TOKEN = os.getenv("TG_TOKEN")
 GROQ_KEY = os.getenv("GROQ_API_KEY")
 if not TG_TOKEN or not GROQ_KEY:
     print("Нет TG_TOKEN или GROQ_API_KEY!"); exit(1)
 
+MODEL = "llama-3.3-70b-versatile"
 client = OpenAI(api_key=GROQ_KEY, base_url="https://api.groq.com/openai/v1")
 
 
-def _llm_call_with_retry(fn, retries=3, base_delay=5.0):
+_RATELIMIT_UNTIL: float = 0.0  # глобальный cooldown после 429
+
+def _llm_call_with_retry(fn, retries=2, base_delay=2.0):
     """
     Обёртка с retry для LLM вызовов.
-    429 (rate limit) → ждём и повторяем.
+    429 (rate limit) → cooldown 15с, затем повтор.
+    Если cooldown активен — сразу возвращаем None (не блокируем asyncio).
     """
+    global _RATELIMIT_UNTIL
+    if time.time() < _RATELIMIT_UNTIL:
+        logger.warning("[LLM] Rate limit cooldown активен — пропускаем вызов")
+        return None
     for attempt in range(retries):
         try:
             return fn()
         except Exception as e:
             msg = str(e).lower()
             if "429" in msg or "rate limit" in msg or "rate_limit" in msg:
-                wait = base_delay * (2 ** attempt)  # 5s, 10s, 20s
+                _RATELIMIT_UNTIL = time.time() + 15.0
+                wait = base_delay * (2 ** attempt)  # 2s, 4s
                 logger.warning(f"[LLM] Rate limit (попытка {attempt+1}/{retries}), жду {wait:.0f}с...")
                 time.sleep(wait)
             else:
-                raise  # остальные ошибки — пробрасываем сразу
+                logger.error(f"[LLM] Ошибка: {e}")
+                return None
     logger.error(f"[LLM] Все {retries} попытки исчерпаны — молчим")
     return None
 
@@ -299,6 +323,28 @@ def init_db():
     )""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_lm_chat ON long_memory(chat_id, event_type)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_lm_user ON long_memory(user_id)")
+
+    # ── САМООБУЧЕНИЕ ────────────────────────────────────────────
+    c.execute("""CREATE TABLE IF NOT EXISTS learned_phrases (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        phrase     TEXT, context TEXT,
+        score      REAL DEFAULT 1.0, uses INTEGER DEFAULT 0, wins INTEGER DEFAULT 0,
+        created_at TEXT, last_used TEXT
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_lp_ctx ON learned_phrases(context, score)")
+    c.execute("""CREATE TABLE IF NOT EXISTS user_style (
+        user_id      INTEGER PRIMARY KEY,
+        best_mode    TEXT DEFAULT 'snark',
+        humor_works  INTEGER DEFAULT 0, mat_works INTEGER DEFAULT 0,
+        absurd_works INTEGER DEFAULT 0, reactions INTEGER DEFAULT 0,
+        updated_at   TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS ai_provocations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT, style TEXT, score REAL DEFAULT 0.5,
+        uses INTEGER DEFAULT 0, created_at TEXT
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_ap_style ON ai_provocations(style, score)")
 
     defaults = [
         ("active",        "1"),
@@ -809,7 +855,7 @@ async def maybe_generate_nickname(user_id: int, user_name: str,
     )
     try:
         resp = _llm_call_with_retry(lambda: client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=MODEL,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=20, temperature=1.2
         ))
@@ -1150,7 +1196,7 @@ JSON (строго без markdown):
 
     try:
         resp = _llm_call_with_retry(lambda: client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=MODEL,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=300, temperature=0.05
         ))
@@ -1622,7 +1668,7 @@ def ask_rex(text, sender_name, sender_id, chat_id, is_group,
 
         _temp = round(random.uniform(0.95, 1.15), 2)  # джиттер температуры
         resp = _llm_call_with_retry(lambda: client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=MODEL,
             messages=messages,
             max_tokens=350,
             temperature=_temp
@@ -1753,10 +1799,10 @@ def get_tts_profile(mode: str, heat_level: float = 0.0) -> dict:
 
 # Вероятность текстового ответа вместо голосового по режиму
 _TEXT_REPLY_CHANCE = {
-    "attack":   0.0,   # атака — всегда войс (страшнее)
-    "conflict": 0.10,  # конфликт — иногда текст
-    "snark":    0.25,  # сарказм — чаще войс, иногда текст
-    "neutral":  0.40,  # нейтрал — может и текстом
+    "attack":   0.0,
+    "conflict": 0.0,
+    "snark":    0.0,
+    "neutral":  0.10,
 }
 
 async def send_reply(update, text: str, mode: str = "neutral", heat: float = 0.0) -> bool:
@@ -1783,18 +1829,10 @@ async def send_reply(update, text: str, mode: str = "neutral", heat: float = 0.0
                 return True
             except Exception as e:
                 logger.error(f"voice reply error: {e}")
-                # фолбэк — текстом
-                try:
-                    await update.message.reply_text(text)
-                    return True
-                except Exception:
-                    return False
-        else:
-            try:
-                await update.message.reply_text(text)
-                return True
-            except Exception:
                 return False
+        else:
+            logger.warning("[TTS] не сгенерировал голос — молчим")
+            return False
 
 
 # Кэш TTS — короткие повторяющиеся фразы (< 60 символов) не перегенерируем
@@ -1808,6 +1846,8 @@ async def make_voice(text: str, mode: str = "neutral", heat: float = 0.0) -> byt
     Короткие фразы кэшируются — не перегенерируются.
     """
     import hashlib
+    if not text or not text.strip():
+        return None
     t = text.strip()
     # Кэшируем только короткие фразы — они повторяются (приветствия, реакции)
     cache_key = None
@@ -2783,15 +2823,16 @@ async def maybe_auto_provoke(bot=None):
                 )
 
             provoke_prompt = (
-                f"Ты Есет — грубый саркастичный бот. В чате давно тишина. "
-                f"Напиши ОДНУ короткую провокационную фразу (1-2 предложения) "
-                f"адресованную {target_name} чтобы расшевелить чат. "
-                f"Будь конкретным, грубым, с матом если нужно.{mem_ctx} "
-                f"Только фразу, без кавычек."
+                f"Ты Есет — грубый саркастичный бот. Напиши ОДНУ провокационную фразу "
+                f"адресованную {target_name} чтобы он ответил. "
+                f"ЗАПРЕЩЕНО: упоминать время суток, часы, 'час дня', 'утро', 'вечер', "
+                f"'тишина', 'никто не пишет', 'слабые'. "
+                f"Атакуй лично — его характер, прошлые слова, слабости.{mem_ctx} "
+                f"Только фраза, без кавычек, 1-2 предложения."
             )
             try:
                 resp = _llm_call_with_retry(lambda: client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
+                    model=MODEL,
                     messages=[{"role": "user", "content": provoke_prompt}],
                     max_tokens=80, temperature=1.1
                 ))
@@ -2998,6 +3039,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     analyzer_record_reply(chat.id, reply)
     save_message(user.id, chat.id, "assistant", reply)
     update_chat_state(chat.id, topic, heat, replied=True)
+    save_bot_reply_for_learning(DB_PATH, chat.id, user.id, reply, decision.mode, topic)
+    if context.chat_data is not None:
+        context.chat_data["last_bot_reply"] = reply
+        context.chat_data["last_bot_mode"]  = decision.mode
 
     _heat_v = float(pre_state[3]) if pre_state and len(pre_state) > 3 else 0.0
     await send_reply(update, reply, mode=decision.mode, heat=_heat_v)
