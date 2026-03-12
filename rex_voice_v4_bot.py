@@ -10,7 +10,7 @@ import edge_tts
 from openai import OpenAI
 
 try:
-    from vocab import (get_vocab_for_prompt, get_random_phrase, MAT, SLANG, SARCASM, PROVOCATIONS,
+    from vocab import (get_vocab_for_prompt, get_random_phrase, MAT, SLANG, SARCASM, PROVOCATIONS, SELFCMD_TEMPLATES,
                         FRIENDLY_WORDS, NEUTRAL_WORDS, WARY_WORDS, HOSTILE_WORDS, HATE_WORDS,
                         POSITIVE_SIGNALS, NEGATIVE_SIGNALS,
                         get_attitude_words, detect_attitude_signal,
@@ -25,6 +25,7 @@ except Exception:
     POSITIVE_SIGNALS = frozenset(); NEGATIVE_SIGNALS = frozenset()
     COUNTER_SELFCMD = []; COUNTER_SELFCMD_SHORT = []
     COUNTER_PARENT = []; COUNTER_PARENT_SHORT = []
+    SELFCMD_TEMPLATES = []
     def get_attitude_words(tone, count=5): return []
     def detect_attitude_signal(text): return 0.0, 0.0
 
@@ -2444,9 +2445,13 @@ async def process_message(update: Update, context, user, chat,
     if directed_at_bot and aggression > 0.6 and len(text) > 3:
         save_grudge(user.id, chat.id, text[:150], heat=aggression)
 
-    # Самокоманда и родительские провокации — помечаем для форс-атаки
-    # (настоящий decision создаётся ниже, там и применим)
-    _force_attack = topic in ("самокоманда", "мамапапа")
+    # Самокоманда и родительские провокации — всегда отвечаем, всегда attack
+    if topic in ("самокоманда", "мамапапа"):
+        if not decision.should_respond:
+            decision = type(decision)(
+                should_respond=True, mode="attack",
+                reason="selfcmd", context_summary=decision.context_summary
+            ) if hasattr(decision, 'context_summary') else decision
 
     label = f"{sender_name} (голосовое)" if is_voice_input else sender_name
     save_message(user.id, chat.id, "user", f"{label}: {text}",
@@ -2538,17 +2543,6 @@ async def process_message(update: Update, context, user, chat,
     logger.info(f"[BRAIN {chat.id}] {sender_name} → "
                 f"{'✅' if decision.should_respond else '❌'} "
                 f"[{decision.mode}] {decision.reason} | {decision.context_summary}")
-
-    # Форс-атака для провокаций (мамапапа/самокоманда) — после создания decision
-    if _force_attack:
-        if not decision.should_respond or decision.mode != "attack":
-            try:
-                decision = type(decision)(
-                    should_respond=True, mode="attack",
-                    reason="провокация", context_summary=decision.context_summary
-                )
-            except Exception:
-                pass  # если dataclass не позволяет — оставляем как есть
 
     if not decision.should_respond:
         return
